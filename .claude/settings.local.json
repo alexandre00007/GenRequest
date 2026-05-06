@@ -5,7 +5,8 @@
       "Bash(python manage.py test generator --verbosity=2)",
       "Bash(python -c \"import django; print\\(django.__file__\\)\")",
       "Bash(mkdir -p /home/claude/GenRequest/.vscode && ls /home/claude/GenRequest/.vscode/ 2>/dev/null)",
-      "Bash(python manage.py test generator --verbosity=0)"
+      "Bash(python manage.py test generator --verbosity=0)",
+      "Bash(python manage.py check)"
     ],
     "additionalDirectories": [
       "/home/claude/GenRequest"
