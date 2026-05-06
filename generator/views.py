@@ -2,6 +2,8 @@ import ast
 import re
 import time
 import json
+from collections import defaultdict, Counter
+from itertools import chain, groupby, combinations
 import ollama
 from django.shortcuts import render, get_object_or_404
 from django.http import StreamingHttpResponse, JsonResponse
@@ -22,9 +24,9 @@ _BLOCKED_PATTERNS = [
     'subprocess', 'eval(', 'exec(', 'compile(', 'globals(', 'locals(',
 ]
 
-# Pre-built ORM helpers injected into every eval context so generated
-# code doesn't need import statements (which require __import__).
+# Pre-injected into every eval context — no imports needed in generated code.
 _ORM_CONTEXT = {
+    # Django ORM
     'Q': Q, 'F': F, 'Count': Count, 'Sum': Sum, 'Avg': Avg,
     'Max': Max, 'Min': Min, 'Value': Value, 'Subquery': Subquery,
     'OuterRef': OuterRef, 'Case': Case, 'When': When,
@@ -32,7 +34,20 @@ _ORM_CONTEXT = {
     'FloatField': FloatField, 'TextField': TextField,
     'Coalesce': Coalesce, 'Concat': Concat,
     'Length': Length, 'Lower': Lower, 'Upper': Upper,
-    'sorted': sorted, 'len': len, 'enumerate': enumerate,
+    # Python stdlib
+    'chain': chain, 'groupby': groupby, 'combinations': combinations,
+    'defaultdict': defaultdict, 'Counter': Counter,
+}
+
+_SAFE_BUILTINS = {
+    'str': str, 'int': int, 'float': float, 'bool': bool,
+    'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
+    'len': len, 'range': range, 'round': round,
+    'sorted': sorted, 'reversed': reversed,
+    'enumerate': enumerate, 'zip': zip, 'map': map, 'filter': filter,
+    'min': min, 'max': max, 'sum': sum, 'abs': abs,
+    'any': any, 'all': all,
+    'isinstance': isinstance, 'hasattr': hasattr, 'getattr': getattr,
 }
 
 OLLAMA_MODEL = 'llama3.1:8b'
@@ -94,9 +109,29 @@ def _find_result_expr(code: str) -> str:
 def _extract_result(queryset):
     """Convert any queryset/value returned by eval into (columns, rows)."""
     if hasattr(queryset, 'model'):
+        # Materialise once so we can inspect what the items actually are.
+        # ValuesQuerySet yields dicts, ValuesListQuerySet yields tuples,
+        # regular QuerySet yields model instances — each needs different handling.
+        items = list(queryset)
+        if not items:
+            return [f.name for f in queryset.model._meta.fields], []
+
+        first = items[0]
+
+        if isinstance(first, dict):
+            # .values() or .values().annotate(...)
+            cols = list(first.keys())
+            return cols, [[str(item.get(k, '')) for k in cols] for item in items]
+
+        if isinstance(first, (list, tuple)):
+            # .values_list()
+            cols = [f'col_{i + 1}' for i in range(len(first))]
+            return cols, [[str(v) for v in row] for row in items]
+
+        # Regular model instances
         columns = [f.name for f in queryset.model._meta.fields]
         rows = []
-        for obj in queryset:
+        for obj in items:
             row = []
             for field in columns:
                 val = getattr(obj, field)
@@ -148,15 +183,26 @@ def stream_query_generation(request):
     query_type = request.POST.get("query_type", "Django ORM")
     dynamic_schema_context = generate_project_schema_context()
 
+    model_names = ", ".join(
+        m.__name__ for m in apps.get_models()
+        if m._meta.app_label not in {'auth', 'contenttypes', 'sessions', 'admin'}
+    )
+    orm_helpers = "Q, F, Count, Sum, Avg, Max, Min, Value, Case, When, Subquery, OuterRef, Coalesce"
+
     system_instruction = (
         "Tu es un générateur de code Django ORM. Ton unique rôle est de produire du code Python exécutable.\n"
         f"{dynamic_schema_context}\n"
+        "CONTEXTE D'EXÉCUTION — ces noms sont déjà disponibles, n'importe rien :\n"
+        f"- Modèles : {model_names}\n"
+        f"- Helpers ORM : {orm_helpers}\n"
+        "- Python : chain, groupby, combinations, defaultdict, Counter, sorted, reversed, zip, map, filter, min, max, sum, any, all, isinstance\n\n"
         "RÈGLES ABSOLUES — toute violation rend la réponse inutilisable :\n"
         "1. Renvoie UNIQUEMENT du code Python exécutable. Aucune phrase, aucune explication.\n"
         "2. Interdit : commentaires (#...), imports, print(), markdown (```), texte en langage naturel.\n"
-        "3. Utilise UNIQUEMENT les modèles et champs listés ci-dessus. N'invente rien.\n"
-        "4. Relations ForeignKey : syntaxe double underscore (ex: author__name).\n"
-        "5. Si plusieurs lignes sont nécessaires, utilise des variables intermédiaires. La dernière ligne doit être l'expression finale à évaluer."
+        "3. Référence les modèles directement par leur nom (ex: Author, Book). Jamais model.Author ou models.Author.\n"
+        "4. Utilise UNIQUEMENT les modèles et champs listés ci-dessus. N'invente rien.\n"
+        "5. Relations ForeignKey : syntaxe double underscore (ex: author__name).\n"
+        "6. Si plusieurs lignes sont nécessaires, utilise des variables intermédiaires. La dernière ligne doit être l'expression finale à évaluer."
     )
 
     def event_stream():
@@ -225,12 +271,7 @@ def execute_generated_query(request):
         all_models = apps.get_models()
         context_globals = {model.__name__: model for model in all_models}
         context_globals.update(_ORM_CONTEXT)
-        context_globals['__builtins__'] = {
-            'str': str, 'int': int, 'float': float, 'bool': bool,
-            'list': list, 'dict': dict, 'tuple': tuple,
-            'round': round, 'len': len, 'sorted': sorted,
-            'enumerate': enumerate, 'zip': zip, 'range': range,
-        }
+        context_globals['__builtins__'] = _SAFE_BUILTINS
 
         model_names = {m.__name__ for m in all_models}
         if not any(name in orm_query for name in model_names):
@@ -242,6 +283,9 @@ def execute_generated_query(request):
         preprocessed = "\n".join(_preprocess(orm_query))
         if not preprocessed.strip():
             return JsonResponse({"error": "Requête vide après nettoyage."}, status=400)
+
+        # Normalize LLM hallucinations: models.Author → Author, model.Author → Author
+        preprocessed = re.sub(r'\bmodels?\.', '', preprocessed)
 
         result_expr = _find_result_expr(preprocessed)
         if not result_expr:
@@ -265,43 +309,59 @@ def execute_generated_query(request):
         )
 
 
-def analyze_results(request):
-    """Stream a natural-language analysis of executed query results."""
+def chat_with_data(request):
+    """Multi-turn chat grounded in schema context and all previously executed results."""
     if request.method != "POST":
         return StreamingHttpResponse("Méthode non autorisée", status=405)
 
-    question = request.POST.get("question", "").strip()
-    if not question:
-        return StreamingHttpResponse("Question vide.", status=400)
+    message = request.POST.get("message", "").strip()
+    if not message:
+        return StreamingHttpResponse("Message vide.", status=400)
 
     try:
-        columns = json.loads(request.POST.get("columns", "[]"))
-        rows = json.loads(request.POST.get("rows", "[]"))
+        history = json.loads(request.POST.get("history", "[]"))
+        data_context = json.loads(request.POST.get("data_context", "[]"))
     except json.JSONDecodeError:
         return StreamingHttpResponse("Données invalides.", status=400)
 
-    header = " | ".join(columns)
-    separator = "-" * len(header)
-    data_lines = [" | ".join(row) for row in rows[:100]]
-    table = "\n".join([header, separator] + data_lines)
+    schema_context = generate_project_schema_context()
 
-    prompt = (
-        f"Voici les données issues d'une requête Django ORM :\n\n{table}\n\n"
-        f"Réponds en français de façon concise et précise. "
-        f"Base-toi uniquement sur ces données.\n\n"
-        f"Question : {question}"
+    data_sections = []
+    for i, ctx in enumerate(data_context[-5:]):  # cap at last 5 result sets
+        label = ctx.get("query", f"Résultat {i + 1}")
+        header = " | ".join(ctx["columns"])
+        rows_str = "\n".join(" | ".join(row) for row in ctx["rows"][:50])
+        data_sections.append(f"[{label}]\n{header}\n{'-' * max(len(header), 1)}\n{rows_str}")
+
+    data_str = "\n\n".join(data_sections) if data_sections else "Aucune donnée exécutée pour l'instant."
+
+    system_content = (
+        "Tu es un assistant expert Django ORM et analyse de données.\n\n"
+        f"SCHÉMA DES MODÈLES :\n{schema_context}\n\n"
+        f"DONNÉES DISPONIBLES (résultats des requêtes exécutées) :\n{data_str}\n\n"
+        "RÈGLES :\n"
+        "- Réponds en français, de façon concise et précise.\n"
+        "- Appuie-toi sur les données disponibles. Ne génère pas de données fictives.\n"
+        "- Si tu proposes du code Django ORM, entoure-le de ```python ... ``` pour qu'il soit exécutable directement.\n"
+        "- Si une question nécessite des données absentes, propose une requête ORM à exécuter."
     )
+
+    messages = [{"role": "system", "content": system_content}]
+    for msg in history[-10:]:  # cap conversation context at last 10 turns
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": message})
 
     def event_stream():
         try:
-            stream = ollama.generate(model=OLLAMA_MODEL, prompt=prompt, stream=True)
+            stream = ollama.chat(model=OLLAMA_MODEL, messages=messages, stream=True)
             for chunk in stream:
-                yield f"data: {json.dumps({'text': chunk['response']})}\n\n"
+                text = chunk["message"]["content"]
+                yield f"data: {json.dumps({'text': text})}\n\n"
             yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
-    response['Cache-Control'] = 'no-cache'
-    response['X-Accel-Buffering'] = 'no'
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
     return response
