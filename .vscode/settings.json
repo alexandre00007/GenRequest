@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "/home/alexandre/.pyenv/versions/esk-3.8.10/bin/python",
+  "python.analysis.extraPaths": [
+    "/home/alexandre/.pyenv/versions/esk-3.8.10/lib/python3.8/site-packages"
+  ]
+}
