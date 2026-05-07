@@ -467,3 +467,65 @@ def delete_chat_session(request, session_id):
         return JsonResponse({'status': 'deleted'})
     except ChatSession.DoesNotExist:
         return JsonResponse({'error': 'Session introuvable'}, status=404)
+
+
+# ── Auto-fix ──────────────────────────────────────────────────────────────
+
+def stream_fix_query(request):
+    """
+    When executed ORM code raises an error, stream a corrected version back.
+    Receives: failed_code, error_message, user_prompt, selected_models.
+    """
+    if request.method != "POST":
+        return StreamingHttpResponse("Méthode non autorisée", status=405)
+
+    failed_code = request.POST.get("failed_code", "").strip()
+    error_message = request.POST.get("error_message", "").strip()
+    user_prompt = request.POST.get("user_prompt", "").strip()
+
+    if not failed_code or not error_message:
+        return StreamingHttpResponse("Code ou erreur manquant.", status=400)
+
+    selected_models_tuple = _parse_selected_models(request.POST.get("selected_models", ""))
+    schema_context = generate_project_schema_context(selected_models_tuple)
+
+    all_models_list = apps.get_models()
+    excluded = {'auth', 'contenttypes', 'sessions', 'admin'}
+    if selected_models_tuple:
+        in_scope = [m for m in all_models_list if m.__name__ in selected_models_tuple]
+    else:
+        in_scope = [m for m in all_models_list if m._meta.app_label not in excluded]
+    model_names = ", ".join(m.__name__ for m in in_scope)
+
+    fix_prompt = (
+        "Tu es un correcteur de code Django ORM. Le code ci-dessous a échoué — analyse l'erreur et renvoie le code corrigé.\n\n"
+        f"SCHÉMA EXACT DES MODÈLES (utilise UNIQUEMENT ces noms) :\n{schema_context}\n"
+        f"MODÈLES DISPONIBLES : {model_names}\n\n"
+        f"CODE ÉCHOUÉ :\n{failed_code}\n\n"
+        f"MESSAGE D'ERREUR : {error_message}\n\n"
+        f"DEMANDE ORIGINALE : {user_prompt}\n\n"
+        "ANALYSE DE L'ERREUR :\n"
+        "- 'Cannot resolve keyword X' → X n'existe pas ; utilise le nom exact du champ ou du reverse accessor listé dans le schéma\n"
+        "- 'invalid literal' ou mauvaise valeur de choice → utilise les valeurs entre crochets [valeurs: ...] listées dans le schéma\n"
+        "- AttributeError sur un objet → vérifie que l'expression finale renvoie bien un QuerySet ou une valeur\n\n"
+        "RÈGLES ABSOLUES :\n"
+        "1. Renvoie UNIQUEMENT le code Python corrigé. Aucune explication, aucun commentaire.\n"
+        "2. Interdit : imports, print(), markdown (```).\n"
+        "3. Utilise UNIQUEMENT les noms de champs et accessors exacts listés dans le schéma ci-dessus.\n"
+        "4. La dernière ligne doit être l'expression à évaluer (QuerySet, agrégat, etc.)."
+    )
+
+    def event_stream():
+        try:
+            stream = ollama.generate(model=OLLAMA_MODEL, prompt=fix_prompt, stream=True)
+            for chunk in stream:
+                text = chunk['response']
+                yield f"data: {json.dumps({'text': text})}\n\n"
+            yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    return response

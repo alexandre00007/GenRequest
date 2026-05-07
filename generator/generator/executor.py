@@ -1,5 +1,7 @@
 from django.apps import apps
-from django.db.models.fields.related import ForeignKey, ManyToManyField
+from django.db.models.fields.related import (
+    ForeignKey, ManyToManyField, ManyToOneRel, ManyToManyRel, OneToOneRel,
+)
 
 _EXCLUDED_APP_LABELS = {'auth', 'contenttypes', 'sessions', 'admin'}
 
@@ -12,7 +14,8 @@ def generate_project_schema_context(selected_models=None) -> str:
     """
     Returns a structured LLM-context string describing available Django models.
     selected_models: tuple of model class names to include, or None for all.
-    Includes verbose_name and help_text so the LLM understands business meaning.
+    Includes verbose_name, help_text, choices, and reverse relation accessors
+    so the LLM has everything it needs to avoid hallucinating field/related names.
     """
     cache_key = selected_models
     if cache_key in _schema_cache:
@@ -31,6 +34,18 @@ def generate_project_schema_context(selected_models=None) -> str:
         lines.append("Champs disponibles :")
 
         for field in model._meta.get_fields():
+            # ── Reverse relations (ForeignKey/M2M defined on the OTHER model) ──
+            if isinstance(field, (ManyToOneRel, OneToOneRel)):
+                accessor = field.get_accessor_name()
+                source = field.related_model.__name__
+                lines.append(f"  - {accessor} (reverse FK depuis {source}) ← utiliser pour filter({accessor}__champ=val)")
+                continue
+            if isinstance(field, ManyToManyRel):
+                accessor = field.get_accessor_name()
+                source = field.related_model.__name__
+                lines.append(f"  - {accessor} (reverse M2M depuis {source})")
+                continue
+
             if not hasattr(field, 'verbose_name'):
                 continue
 
@@ -43,6 +58,12 @@ def generate_project_schema_context(selected_models=None) -> str:
                 annotation = f' — "{v_name}"'
             if help_txt:
                 annotation += f' ({help_txt})'
+
+            # Expose choices values so the LLM uses the exact DB value
+            choices = getattr(field, 'choices', None)
+            if choices:
+                vals = ', '.join(f"'{k}'" for k, _ in choices)
+                annotation += f' [valeurs: {vals}]'
 
             if isinstance(field, ForeignKey):
                 target = field.remote_field.model.__name__

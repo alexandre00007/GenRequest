@@ -280,6 +280,20 @@
   #error-zone strong{display:block;color:var(--red);font-size:.8rem;margin-bottom:4px}
   #error-message{font-family:var(--mono);font-size:.75rem;color:#ffa8a2}
 
+  /* ── Auto-fix banner ─────────────────────────────────────────────────── */
+  #fix-zone{
+    display:none;margin-top:12px;padding:11px 14px;
+    background:rgba(227,179,65,.08);border:1px solid rgba(227,179,65,.35);
+    border-radius:var(--r);
+  }
+  .fix-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .fix-icon{font-size:.9rem;animation:spin 1.2s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .fix-title{font-size:.8rem;font-weight:600;color:var(--orange)}
+  .fix-title.done{color:var(--green)}
+  .fix-title.failed{color:var(--red)}
+  .fix-detail{font-size:.73rem;color:var(--txt3);font-family:var(--mono)}
+
   /* ── Sidebar Cards ───────────────────────────────────────────────────── */
   .s-card{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r2);overflow:hidden}
   .s-card-head{
@@ -454,6 +468,15 @@
       <pre id="error-message"></pre>
     </div>
 
+    <!-- Auto-fix banner -->
+    <div id="fix-zone">
+      <div class="fix-header">
+        <span class="fix-icon" id="fix-icon">⟳</span>
+        <span class="fix-title" id="fix-title">Hallucination détectée — correction automatique en cours…</span>
+      </div>
+      <div class="fix-detail" id="fix-detail"></div>
+    </div>
+
   </main>
 
   <!-- ══ SIDEBAR ══════════════════════════════════════════════════════════ -->
@@ -507,9 +530,11 @@ const state = {
   selectedModels: [],
   sessionId: null,
   sessionName: '',
+  lastPrompt: '',    // saved when generation is triggered
 };
 let allModels = [];
 let mainResultData = { columns: [], rows: [] };
+let _fixAttempt = 0;  // auto-fix retry counter (reset each new generation)
 
 // ── Utilities ─────────────────────────────────────────────────────────────
 const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -786,14 +811,91 @@ async function sendChatMessage(text) {
   } catch(err) { bubble.textContent=`Erreur : ${err.message}`; }
 }
 
+// ── Auto-fix ──────────────────────────────────────────────────────────────
+function _showFixZone(msg, state) {
+  const z = document.getElementById('fix-zone');
+  const icon = document.getElementById('fix-icon');
+  const title = document.getElementById('fix-title');
+  z.style.display = 'block';
+  title.textContent = msg;
+  title.className = 'fix-title' + (state === 'done' ? ' done' : state === 'failed' ? ' failed' : '');
+  icon.style.animation = state === 'pending' ? 'spin 1.2s linear infinite' : 'none';
+  icon.textContent = state === 'done' ? '✓' : state === 'failed' ? '✗' : '⟳';
+}
+
+async function autoFix(failedCode, errorMessage, onSuccess) {
+  if (_fixAttempt >= 1) {
+    // Already tried once — show the hard error and give up
+    document.getElementById('error-message').textContent = errorMessage;
+    document.getElementById('error-zone').style.display = 'block';
+    document.getElementById('fix-zone').style.display = 'none';
+    _fixAttempt = 0;
+    return;
+  }
+  _fixAttempt++;
+  document.getElementById('error-zone').style.display = 'none';
+  _showFixZone('Hallucination détectée — correction automatique en cours…', 'pending');
+  document.getElementById('fix-detail').textContent = errorMessage;
+
+  // Stream the fixed code directly into the code block
+  const oc = document.getElementById('output-code');
+  oc.textContent = '';
+
+  const fd = new FormData();
+  fd.append('failed_code', failedCode);
+  fd.append('error_message', errorMessage);
+  fd.append('user_prompt', state.lastPrompt);
+  fd.append('selected_models', selectedModelsCSV());
+
+  try {
+    await streamSSE("{% url 'fix_query' %}", fd,
+      chunk => { oc.textContent += chunk; Prism.highlightElement(oc); },
+      async () => {
+        const fixedCode = oc.textContent.trim();
+        _showFixZone('Code corrigé — nouvelle exécution…', 'pending');
+        try {
+          await executeORM(fixedCode,
+            d => {
+              _fixAttempt = 0;
+              _showFixZone('✓ Correction automatique réussie', 'done');
+              document.getElementById('fix-detail').textContent = '';
+              onSuccess(d, fixedCode);
+            },
+            err => {
+              _fixAttempt = 0;
+              _showFixZone('Correction insuffisante — erreur persistante', 'failed');
+              document.getElementById('fix-detail').textContent = err;
+              document.getElementById('error-message').textContent = err;
+              document.getElementById('error-zone').style.display = 'block';
+            }
+          );
+        } catch(err) {
+          _fixAttempt = 0;
+          _showFixZone('Erreur réseau lors de la ré-exécution', 'failed');
+        }
+      },
+      err => {
+        _fixAttempt = 0;
+        _showFixZone('Le LLM n\'a pas pu corriger le code', 'failed');
+        document.getElementById('fix-detail').textContent = err;
+      }
+    );
+  } catch(err) {
+    _fixAttempt = 0;
+    _showFixZone('Erreur réseau pendant la correction', 'failed');
+  }
+}
+
 // ── Generation form ───────────────────────────────────────────────────────
 document.getElementById('generator-form').addEventListener('submit', async function(e) {
   e.preventDefault();
   const fd = new FormData(e.target); fd.append('selected_models',selectedModelsCSV());
+  state.lastPrompt = fd.get('user_prompt') || '';
+  _fixAttempt = 0;  // reset fix counter on each new generation
   const oc = document.getElementById('output-code');
   const loader = document.getElementById('loader'); const sub = document.getElementById('submit-btn');
   oc.textContent=''; document.getElementById('generation-metrics').textContent='';
-  ['execution-zone','result-zone','chat-zone','error-zone'].forEach(id=>document.getElementById(id).style.display='none');
+  ['execution-zone','result-zone','chat-zone','error-zone','fix-zone'].forEach(id=>document.getElementById(id).style.display='none');
   loader.style.display='flex'; sub.disabled=true;
   try {
     const resp = await fetch("{% url 'stream_generation' %}",{method:'POST',body:fd,headers:{'X-CSRFToken':fd.get('csrfmiddlewaretoken')}});
@@ -817,21 +919,27 @@ document.getElementById('generator-form').addEventListener('submit', async funct
 // ── Execute button ────────────────────────────────────────────────────────
 document.getElementById('execute-btn').addEventListener('click', async function() {
   const btn=this; const code=document.getElementById('output-code').textContent;
-  ['result-zone','chat-zone','error-zone'].forEach(id=>document.getElementById(id).style.display='none');
+  ['result-zone','chat-zone','error-zone','fix-zone'].forEach(id=>document.getElementById(id).style.display='none');
   btn.disabled=true; btn.textContent='Exécution en cours…';
+
+  const handleSuccess = (d, usedCode) => {
+    const c = usedCode || code;
+    mainResultData={columns:d.columns,rows:d.rows};
+    renderMainTable(d.columns,d.rows,d.row_count);
+    state.dataContext.push({query:c.substring(0,80),columns:d.columns,rows:d.rows});
+    document.getElementById('chat-zone').style.display='block';
+    document.getElementById('chat-messages').innerHTML=''; state.history=[];
+  };
+
   try {
     await executeORM(code,
-      d => {
-        mainResultData={columns:d.columns,rows:d.rows};
-        renderMainTable(d.columns,d.rows,d.row_count);
-        state.dataContext.push({query:code.substring(0,80),columns:d.columns,rows:d.rows});
-        document.getElementById('chat-zone').style.display='block';
-        document.getElementById('chat-messages').innerHTML=''; state.history=[];
-      },
-      err => { document.getElementById('error-message').textContent=err; document.getElementById('error-zone').style.display='block'; }
+      d => handleSuccess(d, code),
+      err => autoFix(code, err, handleSuccess)
     );
-  } catch(err) { document.getElementById('error-message').textContent=err.message; document.getElementById('error-zone').style.display='block'; }
-  finally { btn.disabled=false; btn.innerHTML='<span>⚡</span> Exécuter dans Django'; }
+  } catch(err) {
+    document.getElementById('error-message').textContent=err.message;
+    document.getElementById('error-zone').style.display='block';
+  } finally { btn.disabled=false; btn.innerHTML='<span>⚡</span> Exécuter dans Django'; }
 });
 
 // ── Chat ──────────────────────────────────────────────────────────────────

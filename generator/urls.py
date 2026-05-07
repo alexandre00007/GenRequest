@@ -9,6 +9,8 @@ urlpatterns = [
     path('vote/<int:query_id>/', views.vote_query, name='vote_query'),
     # Model picker API
     path('api/models/', views.list_project_models, name='list_project_models'),
+    # Auto-fix hallucinations
+    path('fix-query/', views.stream_fix_query, name='fix_query'),
     # Session persistence
     path('sessions/', views.list_chat_sessions, name='list_chat_sessions'),
     path('sessions/save/', views.save_chat_session, name='save_chat_session'),
