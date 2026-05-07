@@ -7,4 +7,11 @@ urlpatterns = [
     path('execute-query/', views.execute_generated_query, name='execute_query'),
     path('chat/', views.chat_with_data, name='chat_with_data'),
     path('vote/<int:query_id>/', views.vote_query, name='vote_query'),
+    # Model picker API
+    path('api/models/', views.list_project_models, name='list_project_models'),
+    # Session persistence
+    path('sessions/', views.list_chat_sessions, name='list_chat_sessions'),
+    path('sessions/save/', views.save_chat_session, name='save_chat_session'),
+    path('sessions/<int:session_id>/', views.load_chat_session, name='load_chat_session'),
+    path('sessions/<int:session_id>/delete/', views.delete_chat_session, name='delete_chat_session'),
 ]

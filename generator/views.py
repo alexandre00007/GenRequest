@@ -15,8 +15,8 @@ from django.db.models import (
 )
 from django.db.models.functions import Coalesce, Concat, Length, Lower, Upper
 
-from .models import DatabaseSchema, QueryHistory
-from .generator.executor import generate_project_schema_context
+from .models import DatabaseSchema, QueryHistory, ChatSession, ChatMessage
+from .generator.executor import generate_project_schema_context, get_all_project_models
 
 
 _BLOCKED_PATTERNS = [
@@ -24,9 +24,7 @@ _BLOCKED_PATTERNS = [
     'subprocess', 'eval(', 'exec(', 'compile(', 'globals(', 'locals(',
 ]
 
-# Pre-injected into every eval context — no imports needed in generated code.
 _ORM_CONTEXT = {
-    # Django ORM
     'Q': Q, 'F': F, 'Count': Count, 'Sum': Sum, 'Avg': Avg,
     'Max': Max, 'Min': Min, 'Value': Value, 'Subquery': Subquery,
     'OuterRef': OuterRef, 'Case': Case, 'When': When,
@@ -34,7 +32,6 @@ _ORM_CONTEXT = {
     'FloatField': FloatField, 'TextField': TextField,
     'Coalesce': Coalesce, 'Concat': Concat,
     'Length': Length, 'Lower': Lower, 'Upper': Upper,
-    # Python stdlib
     'chain': chain, 'groupby': groupby, 'combinations': combinations,
     'defaultdict': defaultdict, 'Counter': Counter,
 }
@@ -56,8 +53,9 @@ _IMPORT_RE = re.compile(r'^\s*(import |from \S+ import )')
 _PRINT_RE = re.compile(r'^\s*print\s*\(')
 _COMMENT_RE = re.compile(r'^\s*#')
 _FENCE_RE = re.compile(r'^\s*```')
+
+
 def _preprocess(code: str) -> list:
-    """Strip import/print/comment/fence lines. Preserves indentation."""
     result = []
     for line in code.splitlines():
         stripped = line.strip()
@@ -73,14 +71,6 @@ def _preprocess(code: str) -> list:
 
 
 def _find_result_expr(code: str) -> str:
-    """
-    Parse the preprocessed code with the AST and return the string to eval
-    after exec()-ing the full block.
-
-    - Last statement is a bare expression  → return its source (handles multi-line chains)
-    - Last statement is an assignment      → return the target variable name
-    - Last statement is a control-flow block → walk back to the last assignment
-    """
     try:
         tree = ast.parse(code)
     except SyntaxError:
@@ -93,12 +83,10 @@ def _find_result_expr(code: str) -> str:
     last = tree.body[-1]
 
     if isinstance(last, ast.Expr):
-        # Slice out the exact source lines for this expression (handles chained calls)
         chunk = src_lines[last.lineno - 1:last.end_lineno]
         indent = len(chunk[0]) - len(chunk[0].lstrip())
         return '\n'.join(l[indent:] for l in chunk)
 
-    # Walk back for the last simple assignment (x = ...)
     for stmt in reversed(tree.body):
         if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[-1], ast.Name):
             return stmt.targets[-1].id
@@ -107,11 +95,7 @@ def _find_result_expr(code: str) -> str:
 
 
 def _extract_result(queryset):
-    """Convert any queryset/value returned by eval into (columns, rows)."""
     if hasattr(queryset, 'model'):
-        # Materialise once so we can inspect what the items actually are.
-        # ValuesQuerySet yields dicts, ValuesListQuerySet yields tuples,
-        # regular QuerySet yields model instances — each needs different handling.
         items = list(queryset)
         if not items:
             return [f.name for f in queryset.model._meta.fields], []
@@ -119,16 +103,13 @@ def _extract_result(queryset):
         first = items[0]
 
         if isinstance(first, dict):
-            # .values() or .values().annotate(...)
             cols = list(first.keys())
             return cols, [[str(item.get(k, '')) for k in cols] for item in items]
 
         if isinstance(first, (list, tuple)):
-            # .values_list()
             cols = [f'col_{i + 1}' for i in range(len(first))]
             return cols, [[str(v) for v in row] for row in items]
 
-        # Regular model instances
         columns = [f.name for f in queryset.model._meta.fields]
         rows = []
         for obj in items:
@@ -163,6 +144,15 @@ def _extract_result(queryset):
     return ['Données'], [[str(queryset)]]
 
 
+def _parse_selected_models(raw):
+    if not raw or not raw.strip():
+        return None
+    names = tuple(m.strip() for m in raw.split(',') if m.strip())
+    return names if names else None
+
+
+# ── Page ─────────────────────────────────────────────────────────────────────
+
 def index(request):
     schemas = DatabaseSchema.objects.filter(is_active=True)
     history = QueryHistory.objects.all()[:10]
@@ -171,6 +161,14 @@ def index(request):
         "history": history,
     })
 
+
+# ── API: models list ──────────────────────────────────────────────────────────
+
+def list_project_models(request):
+    return JsonResponse({'models': get_all_project_models()})
+
+
+# ── Generation ────────────────────────────────────────────────────────────────
 
 def stream_query_generation(request):
     if request.method != "POST":
@@ -181,12 +179,18 @@ def stream_query_generation(request):
         return StreamingHttpResponse("Prompt vide.", status=400)
 
     query_type = request.POST.get("query_type", "Django ORM")
-    dynamic_schema_context = generate_project_schema_context()
+    selected_models_tuple = _parse_selected_models(request.POST.get("selected_models", ""))
 
-    model_names = ", ".join(
-        m.__name__ for m in apps.get_models()
-        if m._meta.app_label not in {'auth', 'contenttypes', 'sessions', 'admin'}
-    )
+    dynamic_schema_context = generate_project_schema_context(selected_models_tuple)
+
+    all_models_list = apps.get_models()
+    excluded = {'auth', 'contenttypes', 'sessions', 'admin'}
+    if selected_models_tuple:
+        in_scope = [m for m in all_models_list if m.__name__ in selected_models_tuple]
+    else:
+        in_scope = [m for m in all_models_list if m._meta.app_label not in excluded]
+
+    model_names = ", ".join(m.__name__ for m in in_scope)
     orm_helpers = "Q, F, Count, Sum, Avg, Max, Min, Value, Case, When, Subquery, OuterRef, Coalesce"
 
     system_instruction = (
@@ -252,6 +256,8 @@ def vote_query(request, query_id):
     return JsonResponse({"status": "success"})
 
 
+# ── Execution ─────────────────────────────────────────────────────────────────
+
 def execute_generated_query(request):
     if request.method != "POST":
         return JsonResponse({"error": "Méthode non autorisée"}, status=405)
@@ -284,7 +290,6 @@ def execute_generated_query(request):
         if not preprocessed.strip():
             return JsonResponse({"error": "Requête vide après nettoyage."}, status=400)
 
-        # Normalize LLM hallucinations: models.Author → Author, model.Author → Author
         preprocessed = re.sub(r'\bmodels?\.', '', preprocessed)
 
         result_expr = _find_result_expr(preprocessed)
@@ -309,8 +314,9 @@ def execute_generated_query(request):
         )
 
 
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
 def chat_with_data(request):
-    """Multi-turn chat grounded in schema context and all previously executed results."""
     if request.method != "POST":
         return StreamingHttpResponse("Méthode non autorisée", status=405)
 
@@ -324,10 +330,11 @@ def chat_with_data(request):
     except json.JSONDecodeError:
         return StreamingHttpResponse("Données invalides.", status=400)
 
-    schema_context = generate_project_schema_context()
+    selected_models_tuple = _parse_selected_models(request.POST.get("selected_models", ""))
+    schema_context = generate_project_schema_context(selected_models_tuple)
 
     data_sections = []
-    for i, ctx in enumerate(data_context[-5:]):  # cap at last 5 result sets
+    for i, ctx in enumerate(data_context[-5:]):
         label = ctx.get("query", f"Résultat {i + 1}")
         header = " | ".join(ctx["columns"])
         rows_str = "\n".join(" | ".join(row) for row in ctx["rows"][:50])
@@ -347,7 +354,7 @@ def chat_with_data(request):
     )
 
     messages = [{"role": "system", "content": system_content}]
-    for msg in history[-10:]:  # cap conversation context at last 10 turns
+    for msg in history[-10:]:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": message})
 
@@ -365,3 +372,98 @@ def chat_with_data(request):
     response["Cache-Control"] = "no-cache"
     response["X-Accel-Buffering"] = "no"
     return response
+
+
+# ── Sessions ──────────────────────────────────────────────────────────────────
+
+def list_chat_sessions(request):
+    sessions = ChatSession.objects.prefetch_related('messages').all()[:20]
+    return JsonResponse({
+        'sessions': [
+            {
+                'id': s.id,
+                'name': s.name,
+                'updated_at': s.updated_at.strftime('%d/%m %H:%M'),
+                'message_count': s.messages.count(),
+            }
+            for s in sessions
+        ]
+    })
+
+
+def save_chat_session(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Méthode non autorisée'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'JSON invalide'}, status=400)
+
+    session_id = data.get('session_id')
+    name = (data.get('name') or 'Session sans nom').strip() or 'Session sans nom'
+    history = data.get('history', [])
+    data_context = data.get('data_context', [])
+    selected_models = data.get('selected_models', [])
+
+    session = None
+    if session_id:
+        try:
+            session = ChatSession.objects.get(id=session_id)
+            session.name = name
+            session.selected_models = ','.join(selected_models)
+            session.data_context = json.dumps(data_context)
+            session.save()
+            session.messages.all().delete()
+        except ChatSession.DoesNotExist:
+            session = None
+
+    if session is None:
+        session = ChatSession.objects.create(
+            name=name,
+            selected_models=','.join(selected_models),
+            data_context=json.dumps(data_context),
+        )
+
+    for msg in history:
+        ChatMessage.objects.create(
+            session=session,
+            role=msg.get('role', 'user'),
+            content=msg.get('content', ''),
+        )
+
+    return JsonResponse({'status': 'saved', 'session_id': session.id, 'name': session.name})
+
+
+def load_chat_session(request, session_id):
+    try:
+        session = ChatSession.objects.prefetch_related('messages').get(id=session_id)
+    except ChatSession.DoesNotExist:
+        return JsonResponse({'error': 'Session introuvable'}, status=404)
+
+    history = [{'role': m.role, 'content': m.content} for m in session.messages.all()]
+
+    try:
+        data_context = json.loads(session.data_context)
+    except json.JSONDecodeError:
+        data_context = []
+
+    selected_models = [m for m in session.selected_models.split(',') if m.strip()]
+
+    return JsonResponse({
+        'session_id': session.id,
+        'name': session.name,
+        'history': history,
+        'data_context': data_context,
+        'selected_models': selected_models,
+    })
+
+
+def delete_chat_session(request, session_id):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Méthode non autorisée'}, status=405)
+    try:
+        ChatSession.objects.get(id=session_id).delete()
+        return JsonResponse({'status': 'deleted'})
+    except ChatSession.DoesNotExist:
+        return JsonResponse({'error': 'Session introuvable'}, status=404)

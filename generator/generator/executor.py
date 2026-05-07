@@ -1,23 +1,33 @@
-from functools import lru_cache
 from django.apps import apps
 from django.db.models.fields.related import ForeignKey, ManyToManyField
 
 _EXCLUDED_APP_LABELS = {'auth', 'contenttypes', 'sessions', 'admin'}
 
+# Dict-based cache keyed by selected_models tuple (or None for all).
+# Invalidated by restarting the server after migrations (same as before).
+_schema_cache = {}
 
-@lru_cache(maxsize=1)
-def generate_project_schema_context() -> str:
+
+def generate_project_schema_context(selected_models=None) -> str:
     """
-    Introspects all project models once and returns a structured string
-    describing the schema for use as LLM context.
+    Returns a structured LLM-context string describing available Django models.
+    selected_models: tuple of model class names to include, or None for all.
+    Includes verbose_name and help_text so the LLM understands business meaning.
     """
+    cache_key = selected_models
+    if cache_key in _schema_cache:
+        return _schema_cache[cache_key]
+
     lines = ["Voici la structure exacte et exclusive des modèles Django disponibles :\n"]
 
     for model in apps.get_models():
         if model._meta.app_label in _EXCLUDED_APP_LABELS:
             continue
+        if selected_models and model.__name__ not in selected_models:
+            continue
 
-        lines.append(f"Modèle: {model.__name__}")
+        verbose_name = str(model._meta.verbose_name or model.__name__)
+        lines.append(f"Modèle: {model.__name__} (nom métier: {verbose_name})")
         lines.append("Champs disponibles :")
 
         for field in model._meta.get_fields():
@@ -25,16 +35,40 @@ def generate_project_schema_context() -> str:
                 continue
 
             field_type = field.get_internal_type()
+            v_name = str(getattr(field, 'verbose_name', field.name))
+            help_txt = str(getattr(field, 'help_text', '') or '')
+
+            annotation = ''
+            if v_name and v_name != field.name:
+                annotation = f' — "{v_name}"'
+            if help_txt:
+                annotation += f' ({help_txt})'
 
             if isinstance(field, ForeignKey):
                 target = field.remote_field.model.__name__
-                lines.append(f"  - {field.name} ({field_type}) -> Clé étrangère vers '{target}'")
+                lines.append(f"  - {field.name} (ForeignKey) -> '{target}'{annotation}")
             elif isinstance(field, ManyToManyField):
                 target = field.remote_field.model.__name__
-                lines.append(f"  - {field.name} ({field_type}) -> ManyToMany avec '{target}'")
+                lines.append(f"  - {field.name} (ManyToManyField) -> '{target}'{annotation}")
             else:
-                lines.append(f"  - {field.name} ({field_type})")
+                lines.append(f"  - {field.name} ({field_type}){annotation}")
 
         lines.append("")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    _schema_cache[cache_key] = result
+    return result
+
+
+def get_all_project_models():
+    """Return a list of model info dicts for all non-internal models."""
+    result = []
+    for model in apps.get_models():
+        if model._meta.app_label in _EXCLUDED_APP_LABELS:
+            continue
+        result.append({
+            'name': model.__name__,
+            'app': model._meta.app_label,
+            'verbose': str(model._meta.verbose_name_plural or model.__name__),
+        })
+    return result
