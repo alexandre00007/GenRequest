@@ -7,6 +7,7 @@ urlpatterns = [
     path('execute-query/', views.execute_generated_query, name='execute_query'),
     path('chat/', views.chat_with_data, name='chat_with_data'),
     path('chat/report/', views.generate_chat_report, name='chat_report'),
+    path('chart/fix/', views.fix_chart_hallucination, name='fix_chart'),
     path('vote/<int:query_id>/', views.vote_query, name='vote_query'),
     # Model picker API
     path('api/models/', views.list_project_models, name='list_project_models'),

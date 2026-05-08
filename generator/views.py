@@ -107,7 +107,11 @@ def _extract_result(queryset):
             return cols, [[str(item.get(k, '')) for k in cols] for item in items]
 
         if isinstance(first, (list, tuple)):
-            cols = [f'col_{i + 1}' for i in range(len(first))]
+            fields = getattr(queryset, '_fields', None)
+            if fields and len(fields) == len(first):
+                cols = list(fields)
+            else:
+                cols = [f'col_{i + 1}' for i in range(len(first))]
             return cols, [[str(v) for v in row] for row in items]
 
         columns = [f.name for f in queryset.model._meta.fields]
@@ -358,7 +362,8 @@ def chat_with_data(request):
         '  {"type": "bar", "x": "name", "y": "count", "title": "Livres par auteur"}\n'
         "  ```\n"
         "- Les valeurs de 'x' et 'y' doivent correspondre EXACTEMENT à des colonnes du résultat le plus récent ou de la requête ORM proposée juste au-dessus.\n"
-        "- Pour visualiser des agrégations, propose d'abord une requête ORM avec .values('champ').annotate(count=Count('id')), puis un bloc chart utilisant ces noms de colonnes."
+        "- Pour les données destinées à un graphique, utilise OBLIGATOIREMENT .values('champ_x').annotate(champ_y=Count('id')) — JAMAIS .values_list() — pour que les colonnes portent un nom exploitable.\n"
+        "- Les noms 'x' et 'y' du bloc chart doivent reproduire textuellement les clés du .values() / annotate() de la requête associée."
     )
 
     messages = [{"role": "system", "content": system_content}]
@@ -380,6 +385,84 @@ def chat_with_data(request):
     response["Cache-Control"] = "no-cache"
     response["X-Accel-Buffering"] = "no"
     return response
+
+
+# ── Chart auto-fix ────────────────────────────────────────────────────────────
+
+def fix_chart_hallucination(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Méthode non autorisée"}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "JSON invalide"}, status=400)
+
+    spec = data.get("spec") or {}
+    available_columns = data.get("columns") or []
+    user_intent = (data.get("user_intent") or "").strip()
+    selected_raw = data.get("selected_models") or ""
+    selected_models = _parse_selected_models(selected_raw if isinstance(selected_raw, str) else ",".join(selected_raw))
+
+    schema_context = generate_project_schema_context(selected_models)
+
+    all_models_list = apps.get_models()
+    excluded = {"auth", "contenttypes", "sessions", "admin"}
+    if selected_models:
+        in_scope = [m for m in all_models_list if m.__name__ in selected_models]
+    else:
+        in_scope = [m for m in all_models_list if m._meta.app_label not in excluded]
+    model_names = ", ".join(m.__name__ for m in in_scope)
+
+    chart_type = spec.get("type", "bar")
+    chart_x = spec.get("x", "")
+    chart_y = spec.get("y", "")
+    chart_title = spec.get("title", "")
+
+    fix_prompt = (
+        "Tu dois réparer un graphique qui n'a pas pu s'afficher. La requête ORM précédente "
+        "n'a PAS produit les colonnes attendues par le graphique.\n\n"
+        f"SCHÉMA EXACT DES MODÈLES :\n{schema_context}\n"
+        f"MODÈLES DISPONIBLES : {model_names}\n\n"
+        f"DEMANDE INITIALE DE L'UTILISATEUR : {user_intent or '(non précisée)'}\n\n"
+        f"GRAPHIQUE VOULU :\n  - type  : {chart_type}\n  - x     : {chart_x}\n  - y     : {chart_y}\n  - titre : {chart_title}\n"
+        f"COLONNES OBTENUES (insuffisantes) : {', '.join(available_columns) or '(aucune)'}\n\n"
+        "Génère une nouvelle requête Django ORM qui produit EXACTEMENT deux colonnes correspondant à "
+        f"x='{chart_x}' (libellés) et y='{chart_y}' (valeurs numériques). Utilise OBLIGATOIREMENT "
+        ".values() + .annotate() — JAMAIS .values_list().\n\n"
+        "FORMAT DE RÉPONSE STRICT — uniquement ces deux blocs, dans cet ordre :\n"
+        "```python\n<code Django ORM, dernière ligne = expression à évaluer>\n```\n"
+        "```chart\n{\"type\": \"...\", \"x\": \"...\", \"y\": \"...\", \"title\": \"...\"}\n```\n\n"
+        "RÈGLES ABSOLUES :\n"
+        "1. Aucun import, aucun commentaire, aucun print, aucune explication hors des deux blocs.\n"
+        "2. Les noms 'x' et 'y' du JSON reproduisent EXACTEMENT les clés du .values() ou les alias d'annotate().\n"
+        "3. Référence les modèles directement (Author, Book, etc.) — pas de model.X."
+    )
+
+    try:
+        resp = ollama.generate(model=OLLAMA_MODEL, prompt=fix_prompt, stream=False)
+        raw = resp.get("response", "") or ""
+
+        py_match = re.search(r"```python\s*\n?([\s\S]*?)```", raw)
+        chart_match = re.search(r"```(?:chart|json)\s*\n?([\s\S]*?)```", raw)
+
+        code = py_match.group(1).strip() if py_match else ""
+        new_spec = None
+        if chart_match:
+            try:
+                new_spec = json.loads(chart_match.group(1).strip())
+            except json.JSONDecodeError:
+                new_spec = None
+
+        if not code or not new_spec:
+            return JsonResponse(
+                {"error": "Le LLM n'a pas renvoyé un code + un spec valides.", "raw": raw[:500]},
+                status=502,
+            )
+
+        return JsonResponse({"code": code, "spec": new_spec})
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
