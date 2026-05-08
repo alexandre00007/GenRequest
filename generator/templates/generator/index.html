@@ -8,6 +8,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-one-dark.min.css">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <style>
   /* ── Design Tokens ───────────────────────────────────────────────────── */
   :root {
@@ -329,6 +331,25 @@
 
   /* ── Empty state ─────────────────────────────────────────────────────── */
   .empty{color:var(--txt3);font-size:.78rem;padding:8px 0;text-align:center}
+
+  /* ── Charts ──────────────────────────────────────────────────────────── */
+  .chart-container{margin:8px 0}
+  .chart-card{
+    background:var(--s1);border:1px solid var(--b1);border-radius:var(--r2);
+    padding:14px;
+  }
+  .chart-hint{color:var(--txt3);font-size:.75rem;padding:10px;font-style:italic}
+  .chart-error{color:var(--red);font-size:.75rem;padding:10px;font-family:var(--mono)}
+
+  /* ── Report actions ──────────────────────────────────────────────────── */
+  .report-actions{display:flex;gap:6px}
+  .report-btn{
+    background:var(--s2);color:var(--txt);border:1px solid var(--b1);
+    border-radius:var(--r);padding:5px 10px;cursor:pointer;font-size:.75rem;
+    font-family:var(--ui);font-weight:500;transition:all .12s;
+  }
+  .report-btn:hover:not(:disabled){border-color:var(--green-d);color:var(--green)}
+  .report-btn:disabled{opacity:.5;cursor:not-allowed}
   </style>
 </head>
 <body>
@@ -453,6 +474,10 @@
     <div id="chat-zone">
       <div class="chat-header" style="margin-top:20px">
         <div class="sec-label" style="margin:0;flex:1">Discussion avec vos données</div>
+        <div class="report-actions">
+          <button class="report-btn" data-fmt="html" onclick="downloadReport('html')" title="Télécharger un rapport HTML">📄 Rapport HTML</button>
+          <button class="report-btn" data-fmt="pdf" onclick="downloadReport('pdf')" title="Télécharger un rapport PDF">📑 Rapport PDF</button>
+        </div>
       </div>
       <p style="font-size:.78rem;color:var(--txt3);margin-bottom:10px">Posez des questions, demandez de nouvelles requêtes. L'IA connaît le schéma et tous les résultats exécutés.</p>
       <div id="chat-messages"></div>
@@ -703,22 +728,316 @@ async function deleteSession(e, id) {
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────
+function _looksLikeChartSpec(obj) {
+  return obj && typeof obj === 'object'
+    && typeof obj.type === 'string'
+    && /^(bar|line|pie|doughnut)$/i.test(obj.type)
+    && (obj.x || obj.labels);
+}
+
 function renderAssistant(text) {
   const root = document.createElement('div');
-  text.split(/(```python[\s\S]*?```)/g).forEach(part => {
-    if (part.startsWith('```python')) {
-      const code = part.replace(/^```python\n?/,'').replace(/\n?```$/,'').trim();
-      const wrap = document.createElement('div');
-      const bar = `<div class="code-bar"><span class="code-lang">python</span></div>`;
-      wrap.innerHTML = `<div class="code-block" style="margin:8px 0 4px">${bar}<pre class="language-python"><code class="language-python">${esc(code)}</code></pre></div>`;
-      const btn = document.createElement('button'); btn.className='btn-exec-chat'; btn.textContent='⚡ Exécuter';
-      btn.addEventListener('click',()=>executeChatCode(code,btn)); wrap.appendChild(btn); root.appendChild(wrap);
+  const parts = text.split(/(```[a-zA-Z]*\n?[\s\S]*?```)/g);
+  parts.forEach(part => {
+    if (part.startsWith('```')) {
+      const m = part.match(/^```([a-zA-Z]*)\n?([\s\S]*?)```$/);
+      if (!m) return;
+      const lang = (m[1] || '').toLowerCase();
+      const content = m[2].trim();
+
+      if (lang === 'python') {
+        const wrap = document.createElement('div');
+        const bar = `<div class="code-bar"><span class="code-lang">python</span></div>`;
+        wrap.innerHTML = `<div class="code-block" style="margin:8px 0 4px">${bar}<pre class="language-python"><code class="language-python">${esc(content)}</code></pre></div>`;
+        const btn = document.createElement('button'); btn.className='btn-exec-chat'; btn.textContent='⚡ Exécuter';
+        btn.addEventListener('click',()=>executeChatCode(content,btn,root));
+        wrap.appendChild(btn); root.appendChild(wrap);
+        return;
+      }
+
+      // Try chart detection on chart/json/bare blocks
+      let spec = null;
+      try { spec = JSON.parse(content); } catch {}
+      if (_looksLikeChartSpec(spec)) {
+        const container = document.createElement('div');
+        container.className = 'chart-container';
+        container.dataset.chartSpec = JSON.stringify(spec);
+        root.appendChild(container);
+        renderChartBlock(spec, container, null);
+        return;
+      }
+
+      // Unrecognized fenced block — show as inert code so it's still readable
+      const fb = document.createElement('pre');
+      fb.style.cssText = 'background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:10px;font-family:var(--mono);font-size:.75rem;color:var(--txt2);overflow-x:auto;margin:6px 0;white-space:pre-wrap';
+      fb.textContent = content;
+      root.appendChild(fb);
     } else {
       const t = part.trim(); if (!t) return;
       t.split('\n').forEach(line => { if (!line.trim()) return; const p=document.createElement('p'); p.textContent=line; root.appendChild(p); });
     }
   });
   return root;
+}
+
+const CHART_PALETTE = ['#3fb950','#58a6ff','#e3b341','#f85149','#a371f7','#ff7b72','#79c0ff','#d2a8ff','#ffa657','#56d364'];
+
+function _findCol(columns, name) {
+  if (!name) return -1;
+  const exact = columns.indexOf(name);
+  if (exact !== -1) return exact;
+  const lower = String(name).toLowerCase();
+  return columns.findIndex(c => String(c).toLowerCase() === lower);
+}
+
+function renderChartBlock(spec, container, sourceData) {
+  // sourceData = {columns, rows} or null = use latest dataContext
+  if (container._plotlyDiv) { try { Plotly.purge(container._plotlyDiv); } catch {} container._plotlyDiv = null; }
+  container.innerHTML = '';
+  const card = document.createElement('div'); card.className = 'chart-card';
+  container.appendChild(card);
+
+  const data = sourceData || (state.dataContext.length ? state.dataContext[state.dataContext.length-1] : null);
+  if (!data) {
+    const hint = container.previousElementSibling && container.previousElementSibling.querySelector('.btn-exec-chat')
+      ? 'Exécutez le code ci-dessus pour afficher le graphique.'
+      : 'Aucune donnée disponible. Exécutez d\'abord une requête.';
+    card.innerHTML = `<div class="chart-hint">${esc(hint)}</div>`;
+    return;
+  }
+  const xi = _findCol(data.columns, spec.x);
+  const yi = _findCol(data.columns, spec.y);
+  if (xi === -1 || yi === -1) {
+    card.innerHTML = `<div class="chart-error">Colonne introuvable : ${esc(spec.x)} / ${esc(spec.y)} — disponibles : ${esc(data.columns.join(', '))}</div>`;
+    return;
+  }
+  const labels = data.rows.map(r => String(r[xi]));
+  const values = data.rows.map(r => parseFloat(String(r[yi]).replace(',', '.')) || 0);
+  const type = (spec.type || 'bar').toLowerCase();
+  const isPie = type === 'pie' || type === 'doughnut';
+
+  let traces;
+  if (isPie) {
+    traces = [{
+      type: 'pie',
+      labels, values,
+      hole: type === 'doughnut' ? 0.45 : 0,
+      marker: { colors: CHART_PALETTE, line: { color: '#0d1117', width: 2 } },
+      textfont: { color: '#e6edf3' },
+      hovertemplate: '%{label}<br><b>%{value}</b><extra></extra>',
+    }];
+  } else if (type === 'line') {
+    traces = [{
+      type: 'scatter', mode: 'lines+markers',
+      x: labels, y: values,
+      line: { color: '#3fb950', width: 2.5, shape: 'spline' },
+      marker: { color: '#3fb950', size: 7 },
+      name: spec.y || 'valeur',
+    }];
+  } else {
+    traces = [{
+      type: 'bar', x: labels, y: values,
+      marker: { color: '#3fb950', line: { color: '#238636', width: 1 } },
+      name: spec.y || 'valeur',
+    }];
+  }
+
+  const layout = {
+    title: spec.title ? { text: spec.title, font: { color: '#e6edf3', size: 14, family: 'Inter' }, x: 0.02 } : undefined,
+    paper_bgcolor: '#161b22',
+    plot_bgcolor: '#0d1117',
+    font: { color: '#e6edf3', family: 'Inter, system-ui, sans-serif' },
+    margin: { t: spec.title ? 44 : 20, l: 60, r: 20, b: 60 },
+    xaxis: isPie ? undefined : { gridcolor: 'rgba(48,54,61,0.5)', tickfont: { color: '#8b949e' }, automargin: true, title: { text: spec.x, font: { color: '#8b949e', size: 11 } } },
+    yaxis: isPie ? undefined : { gridcolor: 'rgba(48,54,61,0.5)', tickfont: { color: '#8b949e' }, automargin: true, title: { text: spec.y, font: { color: '#8b949e', size: 11 } } },
+    showlegend: isPie,
+    legend: { font: { color: '#e6edf3' } },
+    hoverlabel: { bgcolor: '#21262d', bordercolor: '#30363d', font: { color: '#e6edf3', family: 'Inter' } },
+  };
+
+  const div = document.createElement('div');
+  div.style.width = '100%';
+  div.style.height = '320px';
+  card.appendChild(div);
+  Plotly.newPlot(div, traces, layout, { displayModeBar: false, responsive: true });
+  container._plotlyDiv = div;
+  container._chartSpec = spec;
+}
+
+function refreshChartsIn(root, sourceData) {
+  if (!root) return;
+  root.querySelectorAll('.chart-container').forEach(c => {
+    try { renderChartBlock(JSON.parse(c.dataset.chartSpec), c, sourceData); } catch {}
+  });
+}
+
+// ── Report generation ────────────────────────────────────────────────────
+function _mdToHtml(md) {
+  if (!md) return '';
+  let html = esc(md);
+  // Code fences
+  html = html.replace(/```(?:python|chart)?\n?([\s\S]*?)```/g, (_, c, offset, full) => {
+    // Strip chart blocks entirely
+    if (full.substr(offset, 8) === '```chart') return '';
+    return `<pre class="rpt-code">${c.trim()}</pre>`;
+  });
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Bold / italic
+  html = html.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+  // Bullet lists
+  html = html.replace(/(?:^- .+(?:\n|$))+/gm, m => {
+    const items = m.split('\n').filter(l => l.startsWith('- ')).map(l => `<li>${l.slice(2)}</li>`).join('');
+    return `<ul>${items}</ul>`;
+  });
+  // Paragraphs
+  return html.split(/\n{2,}/).map(p => {
+    const t = p.trim(); if (!t) return '';
+    if (/^<(h\d|ul|ol|pre|blockquote|table)/.test(t)) return t;
+    return `<p>${t.replace(/\n/g, '<br>')}</p>`;
+  }).join('\n');
+}
+
+async function _collectChartImages() {
+  const images = [];
+  const containers = document.querySelectorAll('#chat-messages .chart-container');
+  for (const c of containers) {
+    if (!c._plotlyDiv) continue;
+    try {
+      const src = await Plotly.toImage(c._plotlyDiv, { format: 'png', width: 900, height: 380, scale: 2 });
+      images.push({ src, title: (c._chartSpec && c._chartSpec.title) || '' });
+    } catch (e) { /* skip */ }
+  }
+  return images;
+}
+
+function _buildReportHTML(summary, chartImages) {
+  const now = new Date().toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' });
+  const session = state.sessionName ? ` · Session : ${esc(state.sessionName)}` : '';
+  const scope = state.selectedModels.length ? ` · Modèles : ${esc(state.selectedModels.join(', '))}` : '';
+
+  let body = `<h1 class="rpt-title">Rapport d'analyse</h1>
+    <div class="rpt-meta">${esc(now)}${session}${scope}</div>
+    <section class="rpt-section">
+      <h2>Synthèse</h2>
+      <div class="rpt-summary">${_mdToHtml(summary) || '<p><em>Aucune synthèse générée.</em></p>'}</div>
+    </section>`;
+
+  if (chartImages.length) {
+    body += `<section class="rpt-section"><h2>Visualisations</h2>`;
+    chartImages.forEach((c, i) => {
+      body += `<div class="rpt-chart">${c.title ? `<div class="rpt-chart-title">${esc(c.title)}</div>` : ''}<img src="${c.src}" alt="Graphique ${i+1}"/></div>`;
+    });
+    body += `</section>`;
+  }
+
+  if (state.dataContext.length) {
+    body += `<section class="rpt-section"><h2>Données extraites</h2>`;
+    state.dataContext.forEach((ctx, i) => {
+      const title = ctx.query ? esc(ctx.query) : `Résultat ${i+1}`;
+      const cols = (ctx.columns || []).map(c => `<th>${esc(c)}</th>`).join('');
+      const showRows = (ctx.rows || []).slice(0, 200);
+      const tbody = showRows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('');
+      const more = (ctx.rows && ctx.rows.length > 200) ? `<div class="rpt-more">Affichage de 200 / ${ctx.rows.length} lignes.</div>` : '';
+      body += `<div class="rpt-data-block"><h3>${title}</h3><table class="rpt-table"><thead><tr>${cols}</tr></thead><tbody>${tbody}</tbody></table>${more}</div>`;
+    });
+    body += `</section>`;
+  }
+
+  if (state.history.length) {
+    body += `<section class="rpt-section"><h2>Échanges</h2>`;
+    state.history.forEach(msg => {
+      const cls = msg.role === 'user' ? 'rpt-msg-user' : 'rpt-msg-asst';
+      const lbl = msg.role === 'user' ? 'Utilisateur' : 'Assistant';
+      body += `<div class="rpt-msg ${cls}"><strong>${lbl}</strong><div>${_mdToHtml(msg.content || '')}</div></div>`;
+    });
+    body += `</section>`;
+  }
+
+  const styles = `
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Inter',sans-serif;max-width:920px;margin:36px auto;padding:0 24px;color:#1f2328;line-height:1.6;background:#fff}
+    .rpt-title{font-size:26px;margin:0 0 4px;color:#0d1117}
+    .rpt-meta{color:#6e7781;font-size:12px;margin-bottom:28px}
+    .rpt-section{margin:28px 0;page-break-inside:avoid}
+    .rpt-section h2{font-size:18px;border-bottom:2px solid #d0d7de;padding-bottom:6px;margin:0 0 14px;color:#0d1117}
+    .rpt-section h3{font-size:14px;color:#424a53;margin:14px 0 6px;font-weight:600}
+    .rpt-summary p{margin:8px 0}
+    .rpt-summary ul{margin:8px 0 8px 24px}
+    .rpt-summary li{margin:4px 0}
+    .rpt-summary strong{color:#0d1117}
+    .rpt-chart{margin:14px 0;page-break-inside:avoid}
+    .rpt-chart-title{font-weight:600;font-size:13px;margin-bottom:6px;color:#424a53}
+    .rpt-chart img{max-width:100%;border:1px solid #d0d7de;border-radius:6px;display:block}
+    .rpt-data-block{margin:14px 0;page-break-inside:auto}
+    .rpt-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+    .rpt-table th,.rpt-table td{border:1px solid #d0d7de;padding:5px 8px;text-align:left}
+    .rpt-table th{background:#f6f8fa;font-weight:600;color:#424a53}
+    .rpt-table tr:nth-child(even) td{background:#f6f8fa}
+    .rpt-more{color:#6e7781;font-size:11px;margin-top:4px;font-style:italic}
+    .rpt-msg{margin:10px 0;padding:9px 12px;border-radius:6px;page-break-inside:avoid}
+    .rpt-msg-user{background:#ddf4ff;border-left:3px solid #218bff}
+    .rpt-msg-asst{background:#f6f8fa;border-left:3px solid #57606a}
+    .rpt-msg strong{display:block;font-size:11px;color:#424a53;margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px;font-weight:700}
+    .rpt-msg p{margin:4px 0;font-size:13px}
+    .rpt-code{background:#f6f8fa;border:1px solid #d0d7de;border-radius:5px;padding:8px 10px;font-family:'JetBrains Mono',Consolas,monospace;font-size:11px;overflow-x:auto;white-space:pre-wrap;color:#1f2328;margin:6px 0}
+  `;
+
+  return `<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>Rapport ORM Studio — ${esc(now)}</title><style>${styles}</style></head><body>${body}</body></html>`;
+}
+
+async function downloadReport(format) {
+  if (!state.history.length && !state.dataContext.length) {
+    alert('Aucun échange ni résultat à inclure dans le rapport. Lancez une requête ou discutez avant de générer un rapport.');
+    return;
+  }
+  const btns = document.querySelectorAll('.report-btn');
+  const original = new Map();
+  btns.forEach(b => { original.set(b, b.textContent); b.disabled = true; });
+  const target = document.querySelector(`.report-btn[data-fmt="${format}"]`);
+  if (target) target.textContent = '⏳ Génération…';
+
+  try {
+    const r = await fetch("{% url 'chat_report' %}", {
+      method: 'POST',
+      headers: { 'X-CSRFToken': csrfToken(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        history: state.history,
+        data_context: state.dataContext,
+        selected_models: state.selectedModels,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'Erreur serveur');
+
+    const chartImages = await _collectChartImages();
+    const html = _buildReportHTML(d.summary || '', chartImages);
+    const baseName = (state.sessionName || 'rapport-orm').replace(/[^a-z0-9-]+/gi, '_').toLowerCase() || 'rapport-orm';
+
+    if (format === 'pdf') {
+      await html2pdf().set({
+        margin: 12,
+        filename: `${baseName}.pdf`,
+        image: { type: 'jpeg', quality: 0.95 },
+        html2canvas: { scale: 2, backgroundColor: '#ffffff', useCORS: true },
+        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+        pagebreak: { mode: ['css', 'legacy'] },
+      }).from(html).save();
+    } else {
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${baseName}.html`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+  } catch (err) {
+    alert('Erreur lors de la génération du rapport : ' + (err.message || err));
+  } finally {
+    btns.forEach(b => { b.disabled = false; b.textContent = original.get(b); });
+  }
 }
 
 function mkResultTable(cols, rows) {
@@ -785,11 +1104,16 @@ async function executeORM(code, onSuccess, onError) {
   onSuccess(d);
 }
 
-async function executeChatCode(code, btn) {
+async function executeChatCode(code, btn, parentRoot) {
   btn.disabled=true; btn.textContent='Exécution…';
   try {
     await executeORM(code,
-      d => { addResultBubble(d.columns,d.rows,`${d.row_count} objet(s)`); state.dataContext.push({query:code.substring(0,80),columns:d.columns,rows:d.rows}); btn.textContent='✓ Exécuté'; },
+      d => {
+        addResultBubble(d.columns,d.rows,`${d.row_count} objet(s)`);
+        state.dataContext.push({query:code.substring(0,80),columns:d.columns,rows:d.rows});
+        btn.textContent='✓ Exécuté';
+        refreshChartsIn(parentRoot, {columns:d.columns, rows:d.rows});
+      },
       err => { btn.disabled=false; btn.textContent='⚡ Exécuter'; const s=Object.assign(document.createElement('span'),{textContent:err,style:'color:var(--red);font-size:.75rem;margin-left:8px'}); btn.parentNode.appendChild(s); }
     );
   } catch { btn.disabled=false; btn.textContent='⚡ Exécuter'; }

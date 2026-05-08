@@ -350,7 +350,15 @@ def chat_with_data(request):
         "- Réponds en français, de façon concise et précise.\n"
         "- Appuie-toi sur les données disponibles. Ne génère pas de données fictives.\n"
         "- Si tu proposes du code Django ORM, entoure-le de ```python ... ``` pour qu'il soit exécutable directement.\n"
-        "- Si une question nécessite des données absentes, propose une requête ORM à exécuter."
+        "- Si une question nécessite des données absentes, propose une requête ORM à exécuter.\n"
+        "- Si l'utilisateur demande un graphique, ouvre un bloc avec la balise EXACTE ```chart (jamais ```json, ```javascript, ni un bloc sans langage). Le contenu doit être UNIQUEMENT un JSON valide :\n"
+        '  {"type": "bar"|"line"|"pie"|"doughnut", "x": "<nom_colonne>", "y": "<nom_colonne>", "title": "<titre>"}\n'
+        "- Exemple OBLIGATOIRE de format :\n"
+        "  ```chart\n"
+        '  {"type": "bar", "x": "name", "y": "count", "title": "Livres par auteur"}\n'
+        "  ```\n"
+        "- Les valeurs de 'x' et 'y' doivent correspondre EXACTEMENT à des colonnes du résultat le plus récent ou de la requête ORM proposée juste au-dessus.\n"
+        "- Pour visualiser des agrégations, propose d'abord une requête ORM avec .values('champ').annotate(count=Count('id')), puis un bloc chart utilisant ces noms de colonnes."
     )
 
     messages = [{"role": "system", "content": system_content}]
@@ -372,6 +380,65 @@ def chat_with_data(request):
     response["Cache-Control"] = "no-cache"
     response["X-Accel-Buffering"] = "no"
     return response
+
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+def generate_chat_report(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Méthode non autorisée"}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "JSON invalide"}, status=400)
+
+    history = data.get("history", [])
+    data_context = data.get("data_context", [])
+
+    convo_lines = []
+    for msg in history[-20:]:
+        role = "Utilisateur" if msg.get("role") == "user" else "Assistant"
+        content = (msg.get("content") or "").strip()
+        if len(content) > 600:
+            content = content[:600] + "…"
+        convo_lines.append(f"{role}: {content}")
+    conversation = "\n".join(convo_lines) if convo_lines else "(Aucun échange)"
+
+    data_lines = []
+    for ctx in data_context[-8:]:
+        cols = ", ".join(ctx.get("columns", []))
+        rows_count = len(ctx.get("rows", []))
+        label = (ctx.get("query") or "").strip()
+        sample_rows = ctx.get("rows", [])[:3]
+        sample = "; ".join(" / ".join(str(v) for v in row) for row in sample_rows)
+        data_lines.append(
+            f"- Requête : {label}\n  Colonnes : {cols}\n  Total : {rows_count} lignes\n  Échantillon : {sample}"
+        )
+    data_summary = "\n".join(data_lines) if data_lines else "Aucune donnée exécutée."
+
+    prompt = (
+        "Tu es un analyste de données. Rédige un RAPPORT DE SYNTHÈSE en français à partir "
+        "de la conversation et des résultats ci-dessous. Le rapport doit être professionnel, "
+        "factuel et concis.\n\n"
+        f"CONVERSATION :\n{conversation}\n\n"
+        f"REQUÊTES EXÉCUTÉES :\n{data_summary}\n\n"
+        "STRUCTURE OBLIGATOIRE (Markdown) :\n"
+        "## Contexte\n2 à 3 phrases sur l'objectif et le périmètre.\n\n"
+        "## Principales observations\nUne liste à puces (3 à 6 points) avec les chiffres clés extraits.\n\n"
+        "## Conclusion\n1 à 2 phrases de synthèse.\n\n"
+        "RÈGLES :\n"
+        "- Cite UNIQUEMENT des chiffres présents dans les résultats.\n"
+        "- N'invente AUCUNE donnée. Si une information manque, dis-le explicitement.\n"
+        "- Ne mentionne PAS les graphiques (ils sont ajoutés automatiquement au rapport).\n"
+        "- N'inclus PAS de code Python."
+    )
+
+    try:
+        resp = ollama.generate(model=OLLAMA_MODEL, prompt=prompt, stream=False)
+        return JsonResponse({"summary": (resp.get("response") or "").strip()})
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
