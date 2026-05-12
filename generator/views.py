@@ -47,7 +47,7 @@ _SAFE_BUILTINS = {
     'isinstance': isinstance, 'hasattr': hasattr, 'getattr': getattr,
 }
 
-OLLAMA_MODEL = 'llama3.1:8b'
+OLLAMA_MODEL = 'qwen2.5-coder:7b'#'llama3.1:8b'
 
 _IMPORT_RE = re.compile(r'^\s*(import |from \S+ import )')
 _PRINT_RE = re.compile(r'^\s*print\s*\(')
